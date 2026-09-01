@@ -1,24 +1,28 @@
 """
-minimal SWE agent —— function calling 版
+minimal SWE agent —— function calling 版（改进版）
 
-用 API 的 function calling（结构化工具调用）代替"解析文字"。
-模型不再输出自由文字，而是输出结构化的工具调用 JSON。
+相对上一版的两个改进：
+改进1：try/except 错误处理 —— 工具出错时喂回错误给模型，而不是崩溃
+改进2：final_answer 工具 —— 让"任务完成"更明确，不再靠猜
 """
 import os
 import json
 import subprocess
 from openai import OpenAI
+from dotenv import load_dotenv
+
+load_dotenv()  # 自动从 .env 文件读取环境变量（API key 不用每次 export 了）
 
 client = OpenAI(
     api_key=os.environ["DEEPSEEK_API_KEY"],
     base_url="https://api.deepseek.com",
 )
 
-# 系统提示词（不再需要教模型"输出格式"，因为工具是用 tools 参数声明的）
 SYSTEM_PROMPT = """你是一个编程 agent，负责完成用户交给你的编程任务。
-请使用提供的工具来读取文件、修改文件、运行命令，最终修复问题并用测试验证。"""
+请使用提供的工具来读取文件、修改文件、运行命令，最终修复问题并用测试验证。
+任务完成后，必须调用 final_answer 工具给出最终回答。"""
 
-# 工具定义：用 JSON schema 声明，API 会强制模型输出结构化的调用
+# 工具定义：三个工具 + 一个 final_answer 工具
 TOOLS = [
     {
         "type": "function",
@@ -63,11 +67,24 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "final_answer",
+            "description": "给出最终回答，任务完成时调用",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "answer": {"type": "string", "description": "最终回答的内容"}
+                },
+                "required": ["answer"],
+            },
+        },
+    },
 ]
 
 
 def call_llm(messages):
-    """调用大模型（带 tools 参数），返回完整的 message 对象"""
     resp = client.chat.completions.create(
         model="deepseek-chat",
         messages=messages,
@@ -76,7 +93,7 @@ def call_llm(messages):
     return resp.choices[0].message
 
 
-# ---------- 三个工具（和之前一样） ----------
+# ---------- 工具函数 ----------
 def read_file(path):
     with open(path, "r", encoding="utf-8") as f:
         return f.read()
@@ -101,6 +118,8 @@ def execute_tool(name, args):
         return write_file(args["path"], args["content"])
     elif name == "run_command":
         return run_command(args["cmd"])
+    elif name == "final_answer":
+        return args["answer"]
     return f"未知工具：{name}"
 
 
@@ -114,27 +133,34 @@ def agent(task):
     for step in range(15):
         message = call_llm(messages)
 
-        # 关键区别：不再解析文字，而是检查 message.tool_calls
         if message.tool_calls:
-            # 把模型的 tool_call 消息加入历史（这是下一步 API 需要的）
             messages.append(message)
 
             for tool_call in message.tool_calls:
                 name = tool_call.function.name
-                args = json.loads(tool_call.function.arguments)  # 结构化参数
+                args = json.loads(tool_call.function.arguments)
                 print(f"\n===== 第 {step+1} 步：调用工具 {name} =====")
-                print(f"参数：{args}")
-                result = execute_tool(name, args)
-                print(f"返回：{result[:150]}")
 
-                # 用专门的 "tool" 角色把结果喂回
+                # 改进1：错误处理——出错不崩溃，把错误喂回给模型
+                try:
+                    result = execute_tool(name, args)
+                except Exception as e:
+                    result = f"工具执行出错：{e}"
+                print(f"返回：{str(result)[:150]}")
+
+                # 改进2：如果调用的是 final_answer，直接返回
+                if name == "final_answer":
+                    print(f"\n✅ 任务完成，最终回答：\n{result}")
+                    return result
+
+                # 把工具结果喂回（final_answer 不会走到这里）
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tool_call.id,
-                    "content": result,
+                    "content": str(result),
                 })
         else:
-            # 没有 tool_calls，说明模型认为任务完成，输出最终回答
+            # 兜底：模型直接输出文字（没有调工具），也当作完成
             print(f"\n✅ 任务完成，最终回答：\n{message.content}")
             return message.content
 

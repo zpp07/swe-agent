@@ -1,5 +1,5 @@
 def add(a, b):
-    return a + b   # 修复：应为 a + b
+    return a + b   # 修复：应该是 a + b
 
 
 def test():
